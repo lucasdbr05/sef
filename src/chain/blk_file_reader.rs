@@ -10,8 +10,7 @@
 
 use std::{
     collections::HashMap,
-    fs,
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    fs, io,
     ops::ControlFlow,
     path::{Path, PathBuf},
 };
@@ -73,14 +72,14 @@ impl BlkFileReader {
         Ok(files)
     }
 
-    /// De-obfuscate a buffer in place, starting at the given file offset.
-    fn deobfuscate_in_place(&self, file_offset: u64, buf: &mut [u8]) {
+    /// De-obfuscate a full blk file in place.
+    fn deobfuscate_file_in_place(&self, buf: &mut [u8]) {
         if self.xor_key.is_empty() {
             return;
         }
         let key_len = self.xor_key.len();
-        for byte in buf.iter_mut() {
-            *byte ^= self.xor_key[(file_offset as usize + 1) % key_len];
+        for (idx, byte) in buf.iter_mut().enumerate() {
+            *byte ^= self.xor_key[idx % key_len];
         }
     }
 
@@ -90,58 +89,39 @@ impl BlkFileReader {
         path: &Path,
         emit: &mut dyn FnMut(BlockHash, Vec<u8>) -> Result<ControlFlow<()>, ChainError>,
     ) -> Result<(), ChainError> {
-        let file = fs::File::open(path)?;
-
-        let file_len = file.metadata()?.len();
-        if file_len < 8 {
+        let mut file_bytes = fs::read(path)?;
+        if file_bytes.len() < 8 {
             return Ok(());
         }
+        self.deobfuscate_file_in_place(&mut file_bytes);
 
-        let mut reader = BufReader::with_capacity(1 << 20, file);
+        let expected_magic = &file_bytes[0..4];
+        let mut file_offset = 0usize;
 
-        let mut magic_buf = [0u8; 4];
-        reader.read_exact(&mut magic_buf)?;
-        self.deobfuscate_in_place(0, &mut magic_buf);
-        let expected_magic = magic_buf;
-
-        reader.seek(SeekFrom::Start(0))?;
-        let mut file_offset = 0;
-        let mut header_buf = [0u8; 8];
-
-        while file_offset + 8 <= file_len {
-            if reader.read_exact(&mut header_buf).is_err() {
-                break;
-            }
-            self.deobfuscate_in_place(file_offset, &mut header_buf);
-
-            let magic = &header_buf[0..4];
+        while file_offset + 8 <= file_bytes.len() {
+            let header = &file_bytes[file_offset..file_offset + 8];
+            let magic = &header[0..4];
             if magic == [0, 0, 0, 0] {
                 break;
             }
 
             if magic != expected_magic {
                 file_offset += 1;
-                reader.seek(SeekFrom::Start(file_offset))?;
                 continue;
             }
 
-            let size = u32::from_le_bytes(header_buf[4..8].try_into().unwrap()) as usize;
+            let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
             if size == 0 || size > 4_000_000 {
                 break;
             }
 
             let data_offset = file_offset + 8;
-            if data_offset + size as u64 > file_len {
+            if data_offset + size > file_bytes.len() {
                 break;
             }
 
-            let mut block_data = vec![0u8; size];
-            if reader.read_exact(&mut block_data).is_err() {
-                break;
-            }
-            self.deobfuscate_in_place(data_offset, &mut block_data);
-
-            file_offset = data_offset + size as u64;
+            let block_data = file_bytes[data_offset..data_offset + size].to_vec();
+            file_offset = data_offset + size;
 
             if block_data.len() >= 80 {
                 match deserialize::<Header>(&block_data[..80]) {
@@ -166,14 +146,17 @@ impl BlkFileReader {
 }
 
 struct BlockMeta {
+    scan_order: usize,
     hash: BlockHash,
     prev_hash: BlockHash,
     data: Vec<u8>,
 }
 
 /// Two-pass strategy: first scans every `blk*.dat` file to collect all blocks
-/// into memory, then walks the `prev_blockhash` chain from genesis to produce
-/// height-ordered [`RawBlock`]s.
+/// into memory, then walks the `prev_blockhash` chain from the earliest known
+/// root to produce height-ordered [`RawBlock`]s. Bitcoin Core does not always
+/// persist genesis in `blk*.dat` (notably on regtest), so the root may be the
+/// first stored block whose parent is absent from the file set.
 impl BlockSource for BlkFileReader {
     fn for_each_block(
         &self,
@@ -182,6 +165,7 @@ impl BlockSource for BlkFileReader {
         let blk_files = self.blk_files()?;
         let mut blocks_by_hash: HashMap<BlockHash, BlockMeta> = HashMap::new();
         let mut genesis_hash: Option<BlockHash> = None;
+        let mut next_scan_order = 0usize;
 
         for blk_path in &blk_files {
             self.scan_blk_file(blk_path, &mut |hash, data| {
@@ -194,23 +178,40 @@ impl BlockSource for BlkFileReader {
                 blocks_by_hash.insert(
                     hash,
                     BlockMeta {
+                        scan_order: next_scan_order,
                         hash,
                         prev_hash: prev,
                         data,
                     },
                 );
+                next_scan_order += 1;
                 Ok(ControlFlow::Continue(()))
             })?;
         }
 
         let mut child_of: HashMap<BlockHash, BlockHash> = HashMap::new();
         for meta in blocks_by_hash.values() {
-            child_of.insert(meta.prev_hash, meta.hash);
+            match child_of
+                .get(&meta.prev_hash)
+                .and_then(|hash| blocks_by_hash.get(hash))
+            {
+                Some(existing) if existing.scan_order <= meta.scan_order => {}
+                _ => {
+                    child_of.insert(meta.prev_hash, meta.hash);
+                }
+            }
         }
 
-        let gen_hash =
-            genesis_hash.ok_or_else(|| ChainError::Parse("no genesis block found".into()))?;
-        let mut current = gen_hash;
+        let root_hash = genesis_hash
+            .or_else(|| {
+                blocks_by_hash
+                    .values()
+                    .filter(|meta| !blocks_by_hash.contains_key(&meta.prev_hash))
+                    .min_by_key(|meta| meta.scan_order)
+                    .map(|meta| meta.hash)
+            })
+            .ok_or_else(|| ChainError::Parse("no chain root found".into()))?;
+        let mut current = root_hash;
         let mut height = 0;
 
         while let Some(m) = blocks_by_hash.remove(&current) {
