@@ -1,4 +1,4 @@
-//! Degree distribution trait and the Robust Soliton Distribution (RSD) for LT codes.
+//! Degree distribution trait, the Ideal Soliton Distribution (ISD), and the Robust Soliton Distribution (RSD) for LT codes.
 //!
 //! This module defines [`DegreeDistribution`], the abstraction over how many source
 //! blocks each encoded droplet combines, and provides the canonical implementation
@@ -33,25 +33,117 @@
 //! ```
 
 use rand::Rng;
+use rand_distr::{Binomial, Distribution, Geometric, Poisson};
 
 /// Trait for swappable degree distributions in fountain codes.
-///
-/// Implementations define how many source symbols are combined into a
-/// single encoded packet (the "degree").
 pub trait DegreeDistribution {
-    /// Samples a degree $d$ satisfying the contract $1 \le d \le K$.
-    ///
-    /// Implementations **must** guarantee the returned value lies in $[1, K]$,
-    /// where $K$ is the number of source blocks. Values outside this range
-    /// will cause out-of-bounds index selection during encoding.
     fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize;
-
-    /// Computes the expected value $E[D]$ of the distribution.
-    ///
-    /// Used for overhead estimation and diagnostic reporting. The value
-    /// reflects the average number of XOR operations per encoded packet
-    /// under the current parameterization.
     fn expected_degree(&self) -> f64;
+}
+
+pub enum AnyDistribution {
+    RobustSoliton(RobustSoliton),
+    IdealSoliton(IdealSoliton),
+    Poisson(PoissonDist),
+    Geometric(GeometricDist),
+    Binomial(BinomialDist),
+}
+
+impl DegreeDistribution for AnyDistribution {
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+        match self {
+            AnyDistribution::RobustSoliton(d) => d.sample_degree(rng),
+            AnyDistribution::IdealSoliton(d) => d.sample_degree(rng),
+            AnyDistribution::Poisson(d) => d.sample_degree(rng),
+            AnyDistribution::Geometric(d) => d.sample_degree(rng),
+            AnyDistribution::Binomial(d) => d.sample_degree(rng),
+        }
+    }
+    fn expected_degree(&self) -> f64 {
+        match self {
+            AnyDistribution::RobustSoliton(d) => d.expected_degree(),
+            AnyDistribution::IdealSoliton(d) => d.expected_degree(),
+            AnyDistribution::Poisson(d) => d.expected_degree(),
+            AnyDistribution::Geometric(d) => d.expected_degree(),
+            AnyDistribution::Binomial(d) => d.expected_degree(),
+        }
+    }
+}
+
+pub struct PoissonDist { pub k: usize, pub lambda: f64 }
+impl DegreeDistribution for PoissonDist {
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+        let dist = Poisson::new(self.lambda).unwrap_or_else(|_| Poisson::new(1.0).unwrap());
+        (dist.sample(rng) as usize).clamp(1, self.k)
+    }
+    fn expected_degree(&self) -> f64 { self.lambda }
+}
+
+pub struct GeometricDist { pub k: usize, pub p: f64 }
+impl DegreeDistribution for GeometricDist {
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+        let dist = Geometric::new(self.p).unwrap_or_else(|_| Geometric::new(0.5).unwrap());
+        ((dist.sample(rng) as usize) + 1).clamp(1, self.k)
+    }
+    fn expected_degree(&self) -> f64 { 1.0 / self.p }
+}
+
+pub struct BinomialDist { pub k: usize, pub n: u64, pub p: f64 }
+impl DegreeDistribution for BinomialDist {
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+        let dist = Binomial::new(self.n, self.p).unwrap_or_else(|_| Binomial::new(1, 0.5).unwrap());
+        (dist.sample(rng) as usize).clamp(1, self.k)
+    }
+    fn expected_degree(&self) -> f64 { self.n as f64 * self.p }
+}
+
+
+pub struct IdealSoliton {
+    cdf: Vec<f64>,
+    pub k: usize,
+}
+
+impl IdealSoliton {
+    pub fn new(k: usize) -> Self {
+        assert!(k > 0, "epoch size k must be > 0");
+        let cdf = Self::build_cdf(k);
+        Self { cdf, k }
+    }
+
+    fn build_cdf(k: usize) -> Vec<f64> {
+        let k_f = k as f64;
+        let mut cdf = vec![0.0f64; k + 1];
+        let mut running_sum = 0.0_f64;
+        for d in 1..=k {
+            let rho = if d == 1 {
+                1.0 / k_f
+            } else {
+                1.0 / (d as f64 * (d as f64 - 1.0))
+            };
+            running_sum += rho;
+            cdf[d] = running_sum;
+        }
+        cdf[k] = 1.0; 
+        cdf
+    }
+}
+
+impl DegreeDistribution for IdealSoliton {
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+        let u: f64 = rng.r#gen();
+        let idx = self.cdf[1..]
+            .binary_search_by(|v| v.partial_cmp(&u).expect("NaN in ISD CDF"))
+            .unwrap_or_else(|e| e);
+        (idx + 1).clamp(1, self.k)
+    }
+
+    fn expected_degree(&self) -> f64 {
+        self.cdf[..=self.k]
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| (i + 1) as f64 * (w[1] - w[0]))
+            .sum()
+    }
 }
 
 /// Robust Soliton Distribution (RSD) for LT (Luby Transform) codes.
